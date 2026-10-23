@@ -28,7 +28,7 @@
  *
  *  VERSION GPU (CUDA) : meme algorithme, la marche des kangourous tourne sur GPU.
  *    Colab  : nvcc -O3 -std=c++17 -arch=sm_XX -Xcompiler -pthread kangaroo.cu -o kangaroo
- *    Options GPU : --gpu  --gblocks N  --gthreads N  --gk K  --gsteps N  --gdev N
+ *    Options GPU : --gpu (tous les GPU)  --gpus N|all  --gdev N  --gblocks N  --gthreads N  --gk K  --gsteps N
  *    Divers      : -y (aucune question)  --save secondes  --gpucheck (autotest GPU)
  *    Sans nvcc   : g++ -O2 -std=c++17 -pthread -x c++ kangaroo.cu  (emulation CPU du GPU, pour tests)
  * ============================================================================
@@ -73,12 +73,12 @@
   #define __forceinline__ inline __attribute__((always_inline))
   #define __ldg(p) (*(p))
   struct dim3_ { unsigned x = 0, y = 0, z = 0; };
-  static dim3_ threadIdx, blockIdx, blockDim, gridDim;
+  static thread_local dim3_ threadIdx, blockIdx, blockDim, gridDim;
   static inline unsigned atomicAdd(unsigned* a, unsigned v) { unsigned o = *a; *a += v; return o; }
   typedef int cudaError_t; enum { cudaSuccess = 0 };
   enum cudaMemcpyKind { cudaMemcpyHostToDevice, cudaMemcpyDeviceToHost };
   struct cudaDeviceProp { char name[256]; int multiProcessorCount; size_t totalGlobalMem; };
-  static inline cudaError_t cudaGetDeviceCount(int* n) { *n = 1; return 0; }
+  static inline cudaError_t cudaGetDeviceCount(int* n) { *n = 4; return 0; }   // 4 "GPU" virtuels pour tester le multi-GPU
   static inline cudaError_t cudaSetDevice(int) { return 0; }
   static inline cudaError_t cudaGetDeviceProperties(cudaDeviceProp* p, int) { strcpy(p->name, "CPU-EMU"); p->multiProcessorCount = 1; p->totalGlobalMem = 0; return 0; }
   static inline cudaError_t cudaMalloc(void** p, size_t n) { *p = malloc(n ? n : 1); return *p ? 0 : 2; }
@@ -625,11 +625,26 @@ static void worker(int tid, bool wild, pt Qp, Counter* cnt, Sink sink, int G, u6
 // ============================================================================
 struct GpuCfg {
     bool enabled = false;
-    int dev = 0, blocks = 0 /* 0 = auto */, threads = 128, K = 64, spl = 32;
+    int dev = 0 /* premier GPU */, ngpu = 0 /* 0 = tous */, blocks = 0 /* 0 = auto */, threads = 128, K = 64, spl = 32;
 };
 static GpuCfg g_gpu;
 static bool g_yes = false;          // pas de questions interactives (Colab, scripts)
 static double g_saveSecs = 600;     // sauvegarde automatique (secondes)
+
+// Liste des GPU a utiliser (--gpus N | all, --gdev premier)
+static int gpu_list(std::vector<int>& devs) {
+    int nd = 0; cudaGetDeviceCount(&nd);
+    int first = g_gpu.dev < 0 ? 0 : g_gpu.dev;
+    int n = g_gpu.ngpu <= 0 ? nd - first : g_gpu.ngpu;
+    if (first + n > nd) n = nd - first;
+    devs.clear();
+    for (int i = 0; i < n; i++) devs.push_back(first + i);
+    if (devs.empty()) {
+        fprintf(stderr, "Aucun GPU CUDA utilisable (Colab/Kaggle : activez un accelerateur GPU).\n");
+        exit(1);
+    }
+    return (int)devs.size();
+}
 
 #define GDEAD 0xFFFFFFFFu
 struct GDP { u64 x0, x1, dl, dh; int sg, pad; };                 // DP renvoye par le GPU
@@ -844,8 +859,8 @@ struct GpuRunner {
         double edp = (double)N * g.spl / std::pow(2.0, C.dpBits); int sp = g.spl;
         while (edp > c.dpcap / 4.0 && sp > 1) { sp /= 2; edp /= 2; }
         c.spl = sp;
-        printf("[GPU] %s : %d blocs x %d threads x %d kangourous = %.2fM kangourous (~%.0f Mo)%s\n",
-               pr.name, g.blocks, g.threads, K, (double)N / 1e6, (double)N * 160 / 1048576.0,
+        printf("[GPU %d] %s : %d blocs x %d threads x %d kangourous = %.2fM kangourous (~%.0f Mo)%s\n",
+               g.dev, pr.name, g.blocks, g.threads, K, (double)N / 1e6, (double)N * 160 / 1048576.0,
 #ifdef __CUDACC__
                ""
 #else
@@ -879,7 +894,7 @@ struct GpuRunner {
             tab[(size_t)j * 10 + 8] = (u64)off; tab[(size_t)j * 10 + 9] = (u64)(off >> 64);
         }
         std::vector<u64> bx(4 * (size_t)T), by(4 * (size_t)T), bdl(T), bdh(T);
-        printf("[GPU] generation de %d points de base (CPU)...\n", T); fflush(stdout);
+        printf("[GPU %d] generation de %d points de base (CPU)...\n", g.dev, T); fflush(stdout);
         int nth = (int)std::max(1u, std::thread::hardware_concurrency());
         std::vector<std::thread> ths;
         for (int wk = 0; wk < nth; wk++) {
@@ -954,8 +969,9 @@ struct GpuRunner {
     void release() { for (void* p : allocs) cudaFree(p); allocs.clear(); }
 };
 
-static void gpu_worker(bool wild, pt Qp, Counter* cnt, Sink sink, u64 seedv) {
-    GpuRunner R; R.setup(g_gpu, wild, Qp, seedv);
+static void gpu_worker(int dev, bool wild, pt Qp, Counter* cnt, Sink sink, u64 seedv) {
+    GpuCfg cfg = g_gpu; cfg.dev = dev;
+    GpuRunner R; R.setup(cfg, wild, Qp, seedv ^ (0xD1B54A32D192ED03ULL * (u64)(dev + 1)));
     std::vector<DPRec> buf;
     const u64 per = (u64)R.N * (u64)R.spl();
     while (!g_stop.load(std::memory_order_relaxed)) {
@@ -973,8 +989,10 @@ static int gpu_selftest() {
     Header h; memset(&h, 0, sizeof h); h.B = 64; h.dpBits = 6; h.NJ = 256; h.mb = default_mb(64, 6); h.seed = 12345;
     set_cfg(h); build_jumps();
     GpuCfg cfg = g_gpu; cfg.enabled = true; cfg.blocks = 4; cfg.threads = 32; cfg.K = 16; cfg.spl = 8;
+    std::vector<int> devs; gpu_list(devs);
     int bad = 0;
-    for (int w = 0; w < 2; w++) {
+    for (int dv : devs) for (int w = 0; w < 2; w++) {
+        cfg.dev = dv;
         pt Qp = w ? mulG(((u128)1 << 60) + 987654321ULL) : PT_INF();
         GpuRunner R; R.setup(cfg, w != 0, Qp, 777 + w);
         std::vector<DPRec> dps;
@@ -988,8 +1006,8 @@ static int gpu_selftest() {
             if (good) dpok++; else dpko++;
         }
         bool pass = ko == 0 && ok > 0 && dpko == 0 && dpok > 0;
-        printf("  [%s] GPU %s : %d/%d kangourous coherents, %d/%d DP coherents (%zu DP recus)\n",
-               pass ? "OK" : "ECHEC", w ? "Wild" : "Tame", ok, ok + ko, dpok, dpok + dpko, dps.size());
+        printf("  [%s] GPU %d %s : %d/%d kangourous coherents, %d/%d DP coherents (%zu DP recus)\n",
+               pass ? "OK" : "ECHEC", dv, w ? "Wild" : "Tame", ok, ok + ko, dpok, dpok + dpko, dps.size());
         if (!pass) bad++;
         R.release();
     }
@@ -1050,7 +1068,8 @@ static int run_tame(Header h, const std::string& fname, std::vector<FileDP>&& ex
     const u64 prevOps = h.tameOps;
     g_stop = false; g_sigint = 0;
     signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
-    int nw = threads + (g_gpu.enabled ? 1 : 0);
+    std::vector<int> gdevs; if (g_gpu.enabled) gpu_list(gdevs);
+    int ng = (int)gdevs.size(), nw = threads + ng;
     Counter* cnt = new Counter[nw];
     Sink sink = [&](std::vector<DPRec>& v) {
         std::lock_guard<std::mutex> lk(g_mtx);
@@ -1064,7 +1083,7 @@ static int run_tame(Header h, const std::string& fname, std::vector<FileDP>&& ex
     u64 base = sr.next();
     std::vector<std::thread> th;
     for (int t = 0; t < threads; t++) th.emplace_back(worker, t, false, PT_INF(), &cnt[t], sink, G, base);
-    if (g_gpu.enabled) th.emplace_back(gpu_worker, false, PT_INF(), &cnt[threads], sink, base);
+    for (int gi = 0; gi < ng; gi++) th.emplace_back(gpu_worker, gdevs[gi], false, PT_INF(), &cnt[threads + gi], sink, base);
     printf("\n[Tame] Demarrage : %d threads x %d kangourous. Ctrl+C = arret + sauvegarde.\n\n", threads, G);
 
     auto t0 = Clock::now(), tLast = t0, tSave = t0;
@@ -1160,13 +1179,14 @@ static SolveResult solve_key(const pt& Q, const std::vector<FileDP>& tame, doubl
         }
     };
     g_stop = false; g_sigint = 0;
-    int nw = threads + (g_gpu.enabled ? 1 : 0);
+    std::vector<int> gdevs; if (g_gpu.enabled) gpu_list(gdevs);
+    int ng = (int)gdevs.size(), nw = threads + ng;
     Counter* cnt = new Counter[nw];
     Rng sr; sr.seed((u64)Clock::now().time_since_epoch().count() ^ Q.x.d[0]);
     u64 base = sr.next();
     std::vector<std::thread> th;
     for (int t = 0; t < threads; t++) th.emplace_back(worker, t, true, Qp, &cnt[t], sink, G, base);
-    if (g_gpu.enabled) th.emplace_back(gpu_worker, true, Qp, &cnt[threads], sink, base);
+    for (int gi = 0; gi < ng; gi++) th.emplace_back(gpu_worker, gdevs[gi], true, Qp, &cnt[threads + gi], sink, base);
 
     auto t0 = Clock::now(), tLast = t0; u64 lastOps = 0; double speed = 0;
     while (!g_stop) {
@@ -1278,20 +1298,21 @@ int main(int argc, char** argv) {
     long long nDPArg = -1; std::string fileArg, keyArg, pubOf;
     double ts = -1, ws = -1, wLimit = 0;
     if (threads < 1) threads = 1;
-    bool tSet = false;
+    bool tSet = false, gpusSet = false, gpuCheck = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i]; auto nx = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
         if (a == "-m") mode = atoi(nx().c_str());
         else if (a == "-t") { threads = std::max(0, atoi(nx().c_str())); tSet = true; }
         else if (a == "--gpu") g_gpu.enabled = true;
-        else if (a == "--gdev") g_gpu.dev = atoi(nx().c_str());
+        else if (a == "--gdev") { g_gpu.dev = atoi(nx().c_str()); if (!gpusSet) g_gpu.ngpu = 1; }
+        else if (a == "--gpus") { std::string v = nx(); g_gpu.enabled = true; gpusSet = true; g_gpu.ngpu = (v == "all") ? 0 : atoi(v.c_str()); }
         else if (a == "--gblocks") g_gpu.blocks = atoi(nx().c_str());
         else if (a == "--gthreads") g_gpu.threads = atoi(nx().c_str());
         else if (a == "--gk") g_gpu.K = atoi(nx().c_str());
         else if (a == "--gsteps") g_gpu.spl = std::max(1, atoi(nx().c_str()));
         else if (a == "--save") g_saveSecs = atof(nx().c_str());
         else if (a == "-y") g_yes = true;
-        else if (a == "--gpucheck") { g_gpu.enabled = true; return gpu_selftest(); }
+        else if (a == "--gpucheck") { g_gpu.enabled = true; gpuCheck = true; }
         else if (a == "-g") G = std::max(8, atoi(nx().c_str()));
         else if (a == "-r") B = atoi(nx().c_str());
         else if (a == "-d") dpBits = atoi(nx().c_str());
@@ -1313,6 +1334,7 @@ int main(int argc, char** argv) {
 #ifndef _WIN32
     if (!isatty(0)) g_yes = true;
 #endif
+    if (gpuCheck) return gpu_selftest();
     if (g_gpu.enabled && !tSet) threads = 0;
     if (!g_gpu.enabled && threads < 1) threads = 1;
     if (ts > 0) C.tameSpread = ts;
